@@ -91,6 +91,18 @@ PROVIDERS: dict[str, Provider] = {
         base_url_var="OLLAMA_BASE_URL",
         requires_key=False,
     ),
+    "anthropic": Provider(
+        name="anthropic",
+        base_url="https://api.anthropic.com",
+        # "auto" is a routing value some Anthropic-protocol relays (e.g.
+        # internal gateways) accept to pick a live channel themselves; the
+        # official API does not recognise it, so a reader pointed at
+        # api.anthropic.com directly must pass --model explicitly.
+        default_model="auto",
+        key_vars=("ANTHROPIC_API_KEY",),
+        base_url_var="ANTHROPIC_BASE_URL",
+        protocol="anthropic",
+    ),
 }
 
 # Provider names used interchangeably in the chapters, mapped to canonical ones.

@@ -176,6 +176,7 @@ def resolve_backend(
             else resolved_model,
             provider=spec.name,
             using_openrouter=spec.name == _OPENROUTER,
+            protocol=spec.protocol,
         )
 
     # 3. Universal fallback.

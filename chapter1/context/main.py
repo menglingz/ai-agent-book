@@ -1094,7 +1094,7 @@ def main():
     parser.add_argument(
         "--provider",
         choices=SUPPORTED_PROVIDERS,
-        default="doubao",
+        default="anthropic",
         help="LLM 提供商（默认：doubao；openrouter 或缺失主 key 时经 OpenRouter 兜底；ollama 为本地免费）"
     )
     parser.add_argument(

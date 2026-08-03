@@ -15,7 +15,7 @@ __all__ = ["Backend", "Provider"]
 
 @dataclass(frozen=True)
 class Provider:
-    """Static description of an OpenAI-compatible backend.
+    """Static description of a backend.
 
     Attributes:
         name: Canonical provider name, e.g. ``"kimi"``.
@@ -38,6 +38,12 @@ class Provider:
             aggregator sharing OpenRouter's id format still has its own
             ``base_url`` and its own key, and is never routed through
             OpenRouter on that basis.
+        protocol: Wire protocol this backend speaks -- ``"openai"`` (the
+            OpenAI-compatible chat completions shape almost every entry in the
+            registry uses) or ``"anthropic"`` (the native Messages API).
+            Callers building an SDK client branch on this rather than on
+            ``name``, so a new native-protocol provider is one registry entry,
+            not a new name check scattered across call sites.
     """
 
     name: str
@@ -47,6 +53,7 @@ class Provider:
     base_url_var: str | None = None
     requires_key: bool = True
     namespaces_models: bool = False
+    protocol: str = "openai"
 
     def api_key(self) -> str:
         """Read this provider's API key from the environment.
@@ -75,7 +82,7 @@ class Provider:
 
 @dataclass(frozen=True)
 class Backend:
-    """A resolved, ready-to-use OpenAI-compatible endpoint.
+    """A resolved, ready-to-use endpoint.
 
     Attributes:
         api_key: Credential for ``base_url``. Never empty -- local runtimes get
@@ -86,6 +93,12 @@ class Backend:
         provider: The provider that was requested, after alias resolution.
         using_openrouter: Whether the request is going through OpenRouter
             rather than the provider's own API.
+        protocol: Wire protocol to speak at ``base_url`` -- ``"openai"`` or
+            ``"anthropic"``. Set once here rather than re-derived by the
+            caller from ``provider``, because the OpenRouter fallback path
+            keeps the original ``provider`` name but always speaks the OpenAI
+            protocol -- a second lookup against the registry could disagree
+            with what this backend actually is.
     """
 
     api_key: str
@@ -93,6 +106,7 @@ class Backend:
     model: str
     provider: str
     using_openrouter: bool
+    protocol: str = "openai"
 
     def __iter__(self):
         """Unpack as the 4-tuple the pre-registry chapter helpers returned.

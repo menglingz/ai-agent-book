@@ -12,7 +12,6 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import requests
-from openai import OpenAI
 import PyPDF2
 from io import BytesIO
 import math
@@ -349,6 +348,212 @@ class ToolRegistry:
             }
 
 
+@dataclass
+class ParsedTurn:
+    """One model turn, normalised across wire protocols.
+
+    ``execute_task`` branches on ``has_tool_calls``/``text``/``reasoning_text``
+    only, never on the raw SDK response shape -- that lets the ReAct loop
+    stay protocol-agnostic while each adapter's ``parse_response`` does the
+    one-time translation.
+    """
+    text: Optional[str]
+    tool_calls: List[Dict[str, Any]]  # [{"id", "name", "arguments", "parse_error"}]
+    reasoning_text: Optional[str]
+    response_dict: Dict[str, Any]  # JSON-serialisable, for api_turns evidence
+
+
+class OpenAIAdapter:
+    """Talks the OpenAI-compatible chat completions protocol.
+
+    This is the pre-existing behaviour of ContextAwareAgent, extracted
+    unchanged so a second protocol can be added without touching it.
+    """
+
+    def tools_schema(self, tools_description: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return tools_description
+
+    def build_request(
+        self, model: str, messages: List[Dict[str, Any]],
+        tools_description: Optional[List[Dict[str, Any]]],
+        temperature: float, max_tokens: int, provider: str, using_openrouter: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Return (create_kwargs, request_data_for_logging)."""
+        request_data = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        create_kwargs = {
+            "model": model,
+            "messages": messages,
+            "tools": None,
+            "tool_choice": None,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": 180,
+        }
+        if tools_description is not None:
+            request_data["tools"] = tools_description
+            request_data["tool_choice"] = "auto"
+            create_kwargs["tools"] = tools_description
+            create_kwargs["tool_choice"] = "auto"
+
+        # DeepSeek V4: enable thinking so reasoning_content is present for the
+        # no_reasoning ablation (parity with thinking defaults of
+        # Doubao/Kimi). Skip when routed via OpenRouter, which may not accept
+        # the same extra body shape.
+        if provider == "deepseek" and not using_openrouter:
+            create_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+            request_data["thinking"] = {"type": "enabled"}
+
+        return create_kwargs, request_data
+
+    def call(self, client, **create_kwargs):
+        return client.chat.completions.create(**create_kwargs)
+
+    def parse_response(self, response) -> ParsedTurn:
+        response_dict = (
+            response.model_dump() if hasattr(response, "model_dump")
+            else response.dict() if hasattr(response, "dict")
+            else {"raw_response": str(response)}
+        )
+        message = response.choices[0].message
+        tool_calls = []
+        for tc in (getattr(message, "tool_calls", None) or []):
+            raw_args = tc.function.arguments or "{}"
+            try:
+                arguments = json.loads(raw_args)
+                parse_error = None
+            except json.JSONDecodeError as exc:
+                arguments = None
+                parse_error = f"Invalid tool arguments (not valid JSON): {exc}. Raw arguments: {raw_args[:500]}"
+            tool_calls.append({
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": arguments,
+                "parse_error": parse_error,
+            })
+        return ParsedTurn(
+            text=message.content,
+            tool_calls=tool_calls,
+            reasoning_text=ContextAwareAgent._reasoning_content(message),
+            response_dict=response_dict,
+        )
+
+    def format_assistant_message(self, response, context_mode: "ContextMode") -> Dict[str, Any]:
+        message = response.choices[0].message
+        msg_dict = message.dict() if hasattr(message, 'dict') else message.model_dump()
+        if context_mode == ContextMode.NO_REASONING and 'reasoning_content' in msg_dict:
+            msg_dict.pop('reasoning_content')
+        return msg_dict
+
+    def format_tool_result_message(self, tool_call_id: str, content: str) -> Dict[str, Any]:
+        return {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+
+
+class AnthropicAdapter:
+    """Talks the native Anthropic Messages API protocol.
+
+    Anthropic has no ``role: "system"`` message and no ``role: "tool"``
+    message -- ``system`` is a top-level request parameter, and tool results
+    travel as ``tool_result`` content blocks inside a ``role: "user"``
+    message. The Messages API also requires every ``tool_use`` block to be
+    followed by a matching ``tool_result`` block in the next message, so
+    NO_TOOL_RESULTS cannot drop that message -- it must keep the block and
+    replace only its content (mirrors the OpenAI adapter's own
+    placeholder-content approach for that ablation).
+    """
+
+    def tools_schema(self, tools_description: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        schema = []
+        for t in tools_description:
+            fn = t["function"]
+            schema.append({
+                "name": fn["name"],
+                "description": fn["description"],
+                "input_schema": fn["parameters"],
+            })
+        return schema
+
+    def _split_system(self, messages: List[Dict[str, Any]]) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+        system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+        rest = [m for m in messages if m.get("role") != "system"]
+        system = "\n\n".join(system_parts) if system_parts else None
+        return system, rest
+
+    def build_request(
+        self, model: str, messages: List[Dict[str, Any]],
+        tools_description: Optional[List[Dict[str, Any]]],
+        temperature: float, max_tokens: int, provider: str, using_openrouter: bool,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        system, rest = self._split_system(messages)
+        request_data = {
+            "model": model,
+            "system": system,
+            "messages": rest,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        create_kwargs = dict(request_data)
+        if tools_description is not None:
+            tools_schema = self.tools_schema(tools_description)
+            request_data["tools"] = tools_schema
+            create_kwargs["tools"] = tools_schema
+        return create_kwargs, request_data
+
+    def call(self, client, **create_kwargs):
+        create_kwargs = {k: v for k, v in create_kwargs.items() if v is not None}
+        return client.messages.create(**create_kwargs)
+
+    def parse_response(self, response) -> ParsedTurn:
+        response_dict = (
+            response.model_dump() if hasattr(response, "model_dump")
+            else response.dict() if hasattr(response, "dict")
+            else {"raw_response": str(response)}
+        )
+        text_parts = []
+        tool_calls = []
+        reasoning_parts = []
+        for block in response.content:
+            block_type = getattr(block, "type", None)
+            if block_type == "text":
+                text_parts.append(block.text)
+            elif block_type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "arguments": block.input,
+                    "parse_error": None,
+                })
+            elif block_type == "thinking":
+                reasoning_parts.append(getattr(block, "thinking", "") or "")
+        return ParsedTurn(
+            text="\n".join(text_parts) if text_parts else None,
+            tool_calls=tool_calls,
+            reasoning_text="\n".join(reasoning_parts) if reasoning_parts else None,
+            response_dict=response_dict,
+        )
+
+    def format_assistant_message(self, response, context_mode: "ContextMode") -> Dict[str, Any]:
+        content = []
+        for block in response.content:
+            block_type = getattr(block, "type", None)
+            if context_mode == ContextMode.NO_REASONING and block_type == "thinking":
+                continue
+            content.append(block.model_dump() if hasattr(block, "model_dump") else block.dict())
+        return {"role": "assistant", "content": content}
+
+    def format_tool_result_message(self, tool_call_id: str, content: str) -> Dict[str, Any]:
+        return {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": tool_call_id, "content": content}
+            ],
+        }
+
+
 class ContextAwareAgent:
     """
     AI Agent with configurable LLM providers and context modes for ablation studies
@@ -383,15 +588,20 @@ class ContextAwareAgent:
         resolved_base_url = backend.base_url
         self.model = backend.model
         self.using_openrouter = backend.using_openrouter
+        self.protocol = backend.protocol
         if self.using_openrouter:
             logger.info(
                 f"{self.provider} API key not set; routing via OpenRouter "
                 f"(model: {self.model})"
             )
-        self.client = OpenAI(
-            api_key=resolved_key,
-            base_url=resolved_base_url
-        )
+        if self.protocol == "anthropic":
+            from anthropic import Anthropic
+            self.client = Anthropic(api_key=resolved_key, base_url=resolved_base_url)
+            self._adapter = AnthropicAdapter()
+        else:
+            from openai import OpenAI
+            self.client = OpenAI(api_key=resolved_key, base_url=resolved_base_url)
+            self._adapter = OpenAIAdapter()
         self.base_url = resolved_base_url
         
         self.context_mode = context_mode
@@ -498,25 +708,6 @@ Important: When you have gathered all necessary information and computed the fin
             }
         ]
     
-    def _prepare_assistant_message(self, message) -> Dict[str, Any]:
-        """
-        Prepare assistant message for adding to messages list, 
-        filtering out reasoning_content if in NO_REASONING mode
-        
-        Args:
-            message: The assistant message object
-            
-        Returns:
-            Dictionary representation of the message
-        """
-        msg_dict = message.dict() if hasattr(message, 'dict') else message.model_dump()
-        
-        # Remove reasoning_content if in NO_REASONING mode
-        if self.context_mode == ContextMode.NO_REASONING and 'reasoning_content' in msg_dict:
-            msg_dict.pop('reasoning_content')
-            
-        return msg_dict
-
     @staticmethod
     def _reasoning_content(message) -> Optional[str]:
         """Return provider reasoning text without assuming one SDK shape."""
@@ -710,45 +901,27 @@ Important: When you have gathered all necessary information and computed the fin
                 # NO_HISTORY it is a sliding window that drops earlier steps.
                 api_messages = self._prepare_messages_for_api()
 
-                # Prepare request data for logging
-                request_data = {
-                    "model": self.model,
-                    "messages": api_messages,
-                    "temperature": _reasoning_safe_temperature(self.model, 0.3),
-                    "max_tokens": 8192
-                }
+                tools_description = (
+                    self._get_tools_description()
+                    if self.context_mode != ContextMode.NO_TOOL_CALLS else None
+                )
 
-                if self.context_mode != ContextMode.NO_TOOL_CALLS:
-                    request_data["tools"] = self._get_tools_description()
-                    request_data["tool_choice"] = "auto"
-
-                # DeepSeek V4: enable thinking so reasoning_content is present
-                # for the no_reasoning ablation (parity with thinking defaults of
-                # Doubao/Kimi). Skip when routed via OpenRouter, which may not
-                # accept the same extra body shape.
-                create_kwargs = {
-                    "model": self.model,
-                    "messages": api_messages,
-                    "tools": self._get_tools_description() if self.context_mode != ContextMode.NO_TOOL_CALLS else None,
-                    "tool_choice": "auto" if self.context_mode != ContextMode.NO_TOOL_CALLS else None,
-                    "temperature": _reasoning_safe_temperature(self.model, 0.3),
-                    "max_tokens": 8192,
-                    "timeout": 180,  # 180 second timeout for main execution
-                }
-                if self.provider == "deepseek" and not getattr(self, "using_openrouter", False):
-                    create_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
-                    request_data["thinking"] = {"type": "enabled"}
+                create_kwargs, request_data = self._adapter.build_request(
+                    model=self.model,
+                    messages=api_messages,
+                    tools_description=tools_description,
+                    temperature=_reasoning_safe_temperature(self.model, 0.3),
+                    max_tokens=8192,
+                    provider=self.provider,
+                    using_openrouter=getattr(self, "using_openrouter", False),
+                )
 
                 logger.info(f"Sending request to {self.provider} API")
 
                 # Call the model with tools
-                response = self.client.chat.completions.create(**create_kwargs)
+                response = self._adapter.call(self.client, **create_kwargs)
 
-                response_dict = (
-                    response.model_dump() if hasattr(response, "model_dump")
-                    else response.dict() if hasattr(response, "dict")
-                    else {"raw_response": str(response)}
-                )
+                parsed = self._adapter.parse_response(response)
                 self.trajectory.api_turns.append({
                     "iteration": iteration,
                     "provider": self.provider,
@@ -756,16 +929,15 @@ Important: When you have gathered all necessary information and computed the fin
                     "base_url": self.base_url,
                     "using_openrouter": bool(getattr(self, "using_openrouter", False)),
                     "request": self._json_snapshot(request_data),
-                    "response": self._json_snapshot(response_dict),
+                    "response": self._json_snapshot(parsed.response_dict),
                 })
-                
+
                 # Log response if verbose
                 if self.verbose:
                     self._log_request_response(request_data, response, iteration)
-                
-                message = response.choices[0].message
-                has_tool_calls = bool(getattr(message, "tool_calls", None))
-                reasoning_content = self._reasoning_content(message)
+
+                has_tool_calls = bool(parsed.tool_calls)
+                reasoning_content = parsed.reasoning_text
                 if reasoning_content:
                     self.trajectory.reasoning_steps.append(reasoning_content)
 
@@ -775,9 +947,9 @@ Important: When you have gathered all necessary information and computed the fin
                 # only "FINAL ANSWER:" broke the loop, so plain replies were
                 # re-sent for up to max_iterations (wasted API calls).
                 if not has_tool_calls:
-                    assistant_msg = self._prepare_assistant_message(message)
+                    assistant_msg = self._adapter.format_assistant_message(response, self.context_mode)
                     messages.append(assistant_msg)
-                    content = (message.content or "").strip()
+                    content = (parsed.text or "").strip()
                     if content:
                         marked = self._extract_final_answer(content)
                         final_answer = marked if marked is not None else content
@@ -793,32 +965,25 @@ Important: When you have gathered all necessary information and computed the fin
                     break
 
                 # --- Continue path: model requested tool execution ---
-                assistant_msg = self._prepare_assistant_message(message)
+                assistant_msg = self._adapter.format_assistant_message(response, self.context_mode)
                 messages.append(assistant_msg)
-                for tool_call in message.tool_calls:
-                    function_name = tool_call.function.name
-                    raw_args = tool_call.function.arguments or "{}"
-                    try:
-                        function_args = json.loads(raw_args)
-                    except json.JSONDecodeError as exc:
-                        # Keep the turn alive on bad tool-arg JSON.
-                        err = (
-                            f"Invalid tool arguments (not valid JSON): {exc}. "
-                            f"Raw arguments: {raw_args[:500]}"
-                        )
+                for tool_call in parsed.tool_calls:
+                    function_name = tool_call["name"]
+                    tool_call_id = tool_call["id"]
+                    if tool_call["parse_error"]:
+                        err = tool_call["parse_error"]
                         logger.warning(err)
                         self.trajectory.tool_calls.append(ToolCall(
                             tool_name=function_name,
                             arguments={},
                             result={"error": err},
                         ))
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": json.dumps({"error": err}),
-                        })
+                        messages.append(self._adapter.format_tool_result_message(
+                            tool_call_id, json.dumps({"error": err})
+                        ))
                         continue
 
+                    function_args = tool_call["arguments"]
                     logger.info(f"Executing tool: {function_name} with args: {function_args}")
 
                     result = self._execute_tool(function_name, function_args)
@@ -831,33 +996,25 @@ Important: When you have gathered all necessary information and computed the fin
                     self.trajectory.tool_calls.append(tool_call_record)
 
                     if self.context_mode != ContextMode.NO_TOOL_RESULTS:
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            # default=str: code_interpreter returns the raw
-                            # namespace in `variables`, which can hold sets,
-                            # dict views etc. that json can't encode — that
-                            # must not abort the whole task.
-                            "content": json.dumps(result, default=str)
-                        }
+                        # default=str: code_interpreter returns the raw
+                        # namespace in `variables`, which can hold sets,
+                        # dict views etc. that json can't encode — that
+                        # must not abort the whole task.
+                        tool_content = json.dumps(result, default=str)
                     else:
-                        tool_msg = {
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": "[Tool result hidden due to context mode]"
-                        }
-                    messages.append(tool_msg)
+                        tool_content = "[Tool result hidden due to context mode]"
+                    messages.append(self._adapter.format_tool_result_message(tool_call_id, tool_content))
 
                 # If the same turn also tagged FINAL ANSWER: (unusual with tools),
                 # still prefer extracting it after tools are recorded.
-                if message.content and "FINAL ANSWER:" in message.content:
-                    final_answer = self._extract_final_answer(message.content)
+                if parsed.text and "FINAL ANSWER:" in parsed.text:
+                    final_answer = self._extract_final_answer(parsed.text)
                     logger.info(f"Final answer found alongside tool calls: {final_answer}")
                     break
 
                 # Note: We do NOT modify the system prompt anymore.
                 # The context is already built into the conversation through tool history
-                    
+
             except TimeoutError as e:
                 logger.error(f"Request timed out after 60 seconds")
                 return {

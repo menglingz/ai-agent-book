@@ -38,6 +38,8 @@ PROVIDER_KEY_VARS = [
     "KIMI_BASE_URL",
     "OLLAMA_BASE_URL",
     "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
 ]
 
 
@@ -130,6 +132,39 @@ def test_explicit_openai_provider_is_not_hijacked_for_gpt5(monkeypatch):
     backend = resolve_backend("openai", model="gpt-5.6-luna")
     assert backend.using_openrouter is False
     assert backend.base_url == "https://api.openai.com/v1"
+
+
+def test_anthropic_provider_resolves_with_protocol_field(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    backend = resolve_backend("anthropic")
+    assert backend.api_key == "test-anthropic-key"
+    assert backend.base_url == "https://api.anthropic.com"
+    assert backend.model == "auto"
+    assert backend.protocol == "anthropic"
+    assert backend.using_openrouter is False
+
+
+def test_anthropic_base_url_override(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://oneapi-comate.baidu-int.com")
+    backend = resolve_backend("anthropic")
+    assert backend.base_url == "https://oneapi-comate.baidu-int.com"
+    assert backend.protocol == "anthropic"
+
+
+def test_anthropic_falls_back_to_openrouter_with_openai_protocol(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key-5")
+    backend = resolve_backend("anthropic")
+    assert backend.using_openrouter is True
+    assert backend.base_url == "https://openrouter.ai/api/v1"
+    # The fallback path always speaks OpenAI-shaped requests, regardless of
+    # which provider was originally requested.
+    assert backend.protocol == "openai"
+
+
+def test_other_providers_default_to_openai_protocol(monkeypatch):
+    monkeypatch.setenv("MOONSHOT_API_KEY", "test-moonshot-key")
+    assert resolve_backend("kimi").protocol == "openai"
 
 
 def test_ollama_needs_no_key():
